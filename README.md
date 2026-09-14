@@ -101,6 +101,11 @@ The `:-:` marker separates the GitLab repository path from the path inside the r
 
 - Listing supports internal paged access and fallback behavior.
 - Uploads use a Git LFS pointer workflow.
+- One filesystem instance reuses one UUID-based branch for all of its uploads.
+- To batch files across separate filesystem instances, pass the same explicit
+  `feature_branch` to every instance or upload in the export.
+- `feature_branch_prefix` remains accepted as a compatibility alias for
+  `feature_branch`.
 - The current focus is the filesystem behavior needed for Galaxy integration first.
 
 ## Status
