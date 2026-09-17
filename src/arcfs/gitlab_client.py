@@ -8,8 +8,28 @@ from urllib.parse import quote
 
 import aiohttp
 
+from .errors import RefNotFound
 from .transactions import commit_lfs_transaction
 from .utils import calculate_sha256
+
+
+async def _gitlab_message(response) -> str:
+    """
+    Return what GitLab said went wrong, or ``""`` if it did not say.
+
+    GitLab reports a refused request under ``message`` and a malformed one under ``error``,
+    so reading only one of them loses half the reasons a call can fail. Anything else, an
+    HTML error page from a proxy or a truncated body included, is treated as having said
+    nothing: this runs only to explain a failure that is already certain, so anything it
+    raised would replace the error it was called to describe with a worse one.
+    """
+    try:
+        body = await response.json()
+    except Exception:  # noqa: BLE001 - see above
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("message") or body.get("error") or "")
 
 
 class GitLabClient:
@@ -1028,6 +1048,11 @@ class GitLabClient:
         Returns:
             Raw GitLab repository file JSON as a dict.
 
+        Raises:
+            RefNotFound: If GitLab could not resolve ``ref``. A subclass of
+                ``FileNotFoundError``, so catching that alone still works.
+            FileNotFoundError: If ``ref`` resolved but does not contain ``path``.
+
         Content is base64-encoded in GitLab's response.
         """
         s = await self._ensure()
@@ -1035,6 +1060,12 @@ class GitLabClient:
 
         async with s.get(url, params={"ref": ref}) as r:
             if r.status == 404:
+                # GitLab answers 404 both for a path that is not in the tree and for a ref it
+                # cannot resolve, and says which in the body. Callers choose between creating
+                # and updating a file on this answer, so reporting a missing ref as a missing
+                # file sends them on to commit against a branch that is not there.
+                if "Commit Not Found" in await _gitlab_message(r):
+                    raise RefNotFound(f"Ref {ref!r} could not be resolved in project {repo_id}")
                 raise FileNotFoundError(path)
             r.raise_for_status()
             return await r.json()

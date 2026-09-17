@@ -11,8 +11,10 @@ import pytest
 from arcfs import NonLFSFileError
 import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
+import arcfs.transactions as transactions
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
+from arcfs.errors import RefNotFound
 from arcfs.gitlab_client import GitLabClient
 from arcfs.transactions import commit_lfs_transaction
 from arcfs.utils import gitattributes_block, lfs_pointer_text, parse_lfs_pointer
@@ -1534,3 +1536,118 @@ def test_expiry_does_not_reach_the_root_project_index():
 
     asyncio.run(fs._ls("", detail=False, refresh=True))
     assert len(fs.client.root_calls) > calls_after_first, "refresh rebuilds the index"
+
+
+# ----------------------------------------------------------------------
+# Telling GitLab's two 404s apart, and reading what it said
+# ----------------------------------------------------------------------
+class FakeResponse:
+    """Just enough of an aiohttp response for the paths that read the body."""
+
+    def __init__(self, status, body, *, content_type="application/json"):
+        self.status = status
+        self._body = body
+        self.headers: dict = {}
+        self.request_info = None
+        self.history = ()
+        self.content_type = content_type
+
+    async def json(self):
+        if self.content_type != "application/json":
+            raise aiohttp.ContentTypeError(None, ())
+        return self._body
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise aiohttp.ClientResponseError(
+                self.request_info, self.history, status=self.status, message="Bad Request"
+            )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeSession:
+    """Session answering every request with one prepared response."""
+
+    def __init__(self, response):
+        self._response = response
+        self.calls: list[tuple[str, str]] = []
+
+    def get(self, url, **kwargs):
+        self.calls.append(("get", url))
+        return self._response
+
+    def post(self, url, **kwargs):
+        self.calls.append(("post", url))
+        return self._response
+
+
+def _client_answering(response):
+    client = GitLabClient("https://example.invalid", "token")
+
+    async def ensure():
+        return FakeSession(response)
+
+    client._ensure = ensure
+    return client
+
+
+def test_a_missing_ref_is_not_reported_as_a_missing_file():
+    """GitLab answers 404 for both and only the body says which.
+
+    A caller choosing between creating and updating reads a missing ref as "no
+    such file" and goes on to commit against a branch that is not there, which
+    GitLab refuses with a 400 that explains nothing.
+    """
+    client = _client_answering(FakeResponse(404, {"message": "404 Commit Not Found"}))
+
+    with pytest.raises(RefNotFound):
+        asyncio.run(client.get_file(1, "README.md", "no-such-branch"))
+
+
+def test_a_missing_file_is_still_a_missing_file():
+    client = _client_answering(FakeResponse(404, {"message": "404 File Not Found"}))
+
+    with pytest.raises(FileNotFoundError) as caught:
+        asyncio.run(client.get_file(1, "nope.md", "main"))
+
+    assert not isinstance(caught.value, RefNotFound)
+
+
+def test_a_missing_ref_is_still_catchable_as_a_missing_file():
+    """Callers written against earlier versions catch FileNotFoundError.
+
+    Making the new exception a subclass is what keeps them working, and a
+    repository with no commits reports a missing ref for its own default
+    branch, where treating it as "nothing to replace" is right.
+    """
+    assert issubclass(RefNotFound, FileNotFoundError)
+
+
+def test_gitattributes_does_not_commit_against_a_branch_that_is_not_there():
+    """The caller named in the report: it catches FileNotFoundError and creates.
+
+    RefNotFound subclasses that, so without re-raising it here the fix would
+    change nothing for the one place in the package that hits it.
+    """
+    commits: list = []
+
+    class Client:
+        async def get_file(self, repo_id, path, ref):
+            raise RefNotFound(ref)
+
+        async def create_commit(self, *args, **kwargs):
+            commits.append(args)
+
+    with pytest.raises(RefNotFound):
+        asyncio.run(
+            transactions.update_gitattributes(
+                client=Client(), repo_id=1, branch="gone", path_str="assays/a.txt"
+            )
+        )
+
+    assert commits == [], "nothing may be committed onto a branch that is not there"

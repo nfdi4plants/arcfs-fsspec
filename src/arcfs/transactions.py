@@ -5,7 +5,7 @@ import binascii
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
-from .errors import NonLFSFileError
+from .errors import NonLFSFileError, RefNotFound
 from .utils import gitattributes_block, lfs_pointer_text, parse_lfs_pointer
 
 
@@ -69,6 +69,10 @@ async def update_gitattributes(*, client, repo_id: int, branch: str, path_str: s
 
     try:
         file_json = await client.get_file(repo_id, ga_path, branch)
+    except RefNotFound:
+        # A ref that will not resolve is not a missing .gitattributes; committing anyway only
+        # turns it into a 400 further along.
+        raise
     except FileNotFoundError:
         action = {
             "action": "create",
