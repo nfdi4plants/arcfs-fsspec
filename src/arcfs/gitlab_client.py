@@ -1115,6 +1115,10 @@ class GitLabClient:
 
         Returns:
             Raw GitLab commit response JSON as a dict.
+
+        Raises:
+            aiohttp.ClientResponseError: If GitLab refuses the commit. Its ``message``
+                carries GitLab's own reason when the response supplies one.
         """
         s = await self._ensure()
         url = self._commits_url(repo_id)
@@ -1126,6 +1130,20 @@ class GitLabClient:
         }
 
         async with s.post(url, json=payload) as r:
+            # GitLab funnels every reason a commit was refused into one status and puts the
+            # difference in the body: a protected branch, a stale last_commit_id and a path
+            # that already exists all arrive as 400 Bad Request. raise_for_status keeps only
+            # the status and the reason phrase, so the one thing telling them apart is lost
+            # before the caller ever sees it.
+            message = await _gitlab_message(r) if r.status >= 400 else ""
+            if message:
+                raise aiohttp.ClientResponseError(
+                    r.request_info,
+                    r.history,
+                    status=r.status,
+                    message=message,
+                    headers=r.headers,
+                )
             r.raise_for_status()
             return await r.json()
 

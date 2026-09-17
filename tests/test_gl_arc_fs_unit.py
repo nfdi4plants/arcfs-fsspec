@@ -1651,3 +1651,41 @@ def test_gitattributes_does_not_commit_against_a_branch_that_is_not_there():
         )
 
     assert commits == [], "nothing may be committed onto a branch that is not there"
+
+
+# ----------------------------------------------------------------------
+# What GitLab said when it refused a commit
+# ----------------------------------------------------------------------
+def test_a_refused_commit_carries_the_reason_gitlab_gave():
+    """Without the body a 400 says nothing a caller can act on.
+
+    A protected branch, a stale last_commit_id and a path that already exists
+    all arrive as 400 Bad Request, and the body is the only thing between them.
+    """
+    client = _client_answering(
+        FakeResponse(400, {"message": "A file with this name already exists"})
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert "already exists" in caught.value.message
+    assert caught.value.status == 400
+
+def test_a_malformed_request_carries_its_reason_too():
+    """GitLab puts a parameter complaint under "error", not "message"."""
+    client = _client_answering(FakeResponse(400, {"error": "branch is missing"}))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert "branch is missing" in caught.value.message
+
+def test_an_error_without_a_readable_body_still_raises():
+    """A proxy answering HTML must not turn into a different failure."""
+    client = _client_answering(FakeResponse(502, "<html>bad gateway</html>", content_type="text/html"))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert caught.value.status == 502
