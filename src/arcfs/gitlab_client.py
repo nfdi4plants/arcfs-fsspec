@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
@@ -11,6 +12,17 @@ import aiohttp
 from .errors import RefNotFound
 from .transactions import commit_lfs_transaction
 from .utils import calculate_sha256
+
+
+def _message_from_text(text: str) -> str:
+    """Return what GitLab said went wrong, given a body already read as text."""
+    try:
+        body = json.loads(text)
+    except Exception:  # noqa: BLE001 - a body that will not parse simply said nothing
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("message") or body.get("error") or "")
 
 
 async def _gitlab_message(response) -> str:
@@ -1091,10 +1103,27 @@ class GitLabClient:
         url = self._branches_url(repo_id)
 
         async with s.post(url, data={"branch": branch, "ref": ref}) as r:
-            if r.status == 400:
-                text = await r.text()
-                if "already exists" in text.lower():
-                    return
+            if r.status < 400:
+                return
+            # This is the first write of the transaction, so a refusal here is what a caller
+            # actually meets: a protected branch, a missing source ref, a token that cannot push.
+            # raise_for_status keeps only "Bad Request", so without reading the body the reason
+            # is gone one frame before create_commit, which already does read it.
+            text = await r.text()
+            # Read the raw text for this, not the parsed message: an instance behind a proxy can
+            # answer with something that is not JSON, and treating "already exists" as a failure
+            # would turn a second upload with the same token into an error.
+            if r.status == 400 and "already exists" in text.lower():
+                return
+            message = _message_from_text(text)
+            if message:
+                raise aiohttp.ClientResponseError(
+                    r.request_info,
+                    r.history,
+                    status=r.status,
+                    message=message,
+                    headers=r.headers,
+                )
             r.raise_for_status()
 
     async def create_commit(

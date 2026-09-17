@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 from collections.abc import Iterable
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -1557,6 +1558,9 @@ class FakeResponse:
             raise aiohttp.ContentTypeError(None, ())
         return self._body
 
+    async def text(self):
+        return self._body if isinstance(self._body, str) else json.dumps(self._body)
+
     def raise_for_status(self):
         if self.status >= 400:
             raise aiohttp.ClientResponseError(
@@ -1689,3 +1693,31 @@ def test_an_error_without_a_readable_body_still_raises():
         asyncio.run(client.create_commit(1, "main", "msg", []))
 
     assert caught.value.status == 502
+
+def test_a_refused_branch_carries_the_reason_gitlab_gave():
+    """create_branch is the transaction's first write, so a refusal here is what a caller meets.
+
+    A protected branch, a missing source ref and a token that cannot push all arrive as 400,
+    and the body is the only thing between them. create_commit was fixed for this; this call
+    sits one frame earlier and was not.
+    """
+    client = _client_answering(FakeResponse(400, {"message": "You are not allowed to create branches"}))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_branch(1, "run_results-x", "main"))
+
+    assert "not allowed to create branches" in caught.value.message
+
+
+def test_a_branch_that_already_exists_is_still_success():
+    """Two uploads with one token share a branch, so the second must not fail."""
+    client = _client_answering(FakeResponse(400, {"message": "Branch already exists"}))
+    asyncio.run(client.create_branch(1, "run_results-x", "main"))
+
+
+def test_a_branch_that_already_exists_is_success_even_without_json():
+    """An instance behind a proxy can answer with something that is not JSON."""
+    client = _client_answering(
+        FakeResponse(400, "<html>Branch already exists</html>", content_type="text/html")
+    )
+    asyncio.run(client.create_branch(1, "run_results-x", "main"))
