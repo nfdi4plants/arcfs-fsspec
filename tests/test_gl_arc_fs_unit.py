@@ -880,6 +880,28 @@ def test_open_sync_hook_returns_async_lfs_file():
         fs.close()
 
 
+@pytest.mark.parametrize("mode", ["wb", "w", "ab", "xb", "r+b", "rb+", "w+b"])
+def test_open_sync_refuses_a_write_rather_than_losing_it(mode):
+    """A synchronous open() cannot hand back a working writer.
+
+    AsyncLFSFile's write and close are coroutine functions, so f.write(data) and f.close()
+    return coroutines that nothing awaits: the upload is discarded and no error is raised.
+    Refusing is not a limitation being added, it is a silent failure being made audible.
+    """
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    try:
+        with pytest.raises(NotImplementedError, match="synchronous open"):
+            fs._open("group/repo1/README.md", mode=mode)
+    finally:
+        fs.close()
+
+
 @pytest.mark.asyncio
 async def test_root_listing_detail_false(fs: GitLabARCFileSystem):
     out = await fs._ls("", detail=False)

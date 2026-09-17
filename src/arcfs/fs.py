@@ -349,6 +349,16 @@ class GitLabARCFileSystem(AsyncFileSystem):
         if self.asynchronous:
             raise RuntimeError("Use open_async() with asynchronous=True filesystems")
 
+        # AsyncLFSFile's write and close are coroutine functions, so from a synchronous open
+        # nothing awaits them: a write-then-close writes nothing, commits nothing and reports no
+        # error. The test is for write intent because "r+b" is read-write.
+        if set(mode) & set("wax+"):
+            raise NotImplementedError(
+                "Writing through a synchronous open() is not supported: the file object it would "
+                "return commits from coroutines that nothing awaits, so the data would be lost "
+                "without an error. Use put_file(), or open_async() on an asynchronous filesystem."
+            )
+
         feature_branch = self._normalize_feature_branch(
             feature_branch,
             kwargs.pop("feature_branch_prefix", None),
