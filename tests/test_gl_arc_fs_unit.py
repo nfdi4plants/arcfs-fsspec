@@ -145,9 +145,13 @@ class FakeGitLabClient:
 
 
 class FakeResponse:
-    def __init__(self, status, json_data):
+    def __init__(self, status, json_data, content_type="application/json"):
         self.status = status
         self.json_data = json_data
+        self.content_type = content_type
+        self.headers: dict = {}
+        self.request_info = None
+        self.history = ()
         self.error = aiohttp.ClientResponseError(
             request_info=None,
             history=(),
@@ -165,7 +169,12 @@ class FakeResponse:
             raise self.error
 
     async def json(self):
+        if self.content_type != "application/json":
+            raise aiohttp.ContentTypeError(None, ())
         return self.json_data
+
+    async def text(self):
+        return self.json_data if isinstance(self.json_data, str) else json.dumps(self.json_data)
 
 
 class FakeSession:
@@ -1564,61 +1573,11 @@ def test_expiry_does_not_reach_the_root_project_index():
 # ----------------------------------------------------------------------
 # Telling GitLab's two 404s apart, and reading what it said
 # ----------------------------------------------------------------------
-class FakeResponse:
-    """Just enough of an aiohttp response for the paths that read the body."""
-
-    def __init__(self, status, body, *, content_type="application/json"):
-        self.status = status
-        self._body = body
-        self.headers: dict = {}
-        self.request_info = None
-        self.history = ()
-        self.content_type = content_type
-
-    async def json(self):
-        if self.content_type != "application/json":
-            raise aiohttp.ContentTypeError(None, ())
-        return self._body
-
-    async def text(self):
-        return self._body if isinstance(self._body, str) else json.dumps(self._body)
-
-    def raise_for_status(self):
-        if self.status >= 400:
-            raise aiohttp.ClientResponseError(
-                self.request_info, self.history, status=self.status, message="Bad Request"
-            )
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class FakeSession:
-    """Session answering every request with one prepared response."""
-
-    def __init__(self, response):
-        self._response = response
-        self.calls: list[tuple[str, str]] = []
-
-    def get(self, url, **kwargs):
-        self.calls.append(("get", url))
-        return self._response
-
-    def post(self, url, **kwargs):
-        self.calls.append(("post", url))
-        return self._response
-
-
 def _client_answering(response):
+    """A client whose next request, get or post, is answered with ``response``."""
+    session = FakeSession([response], post_response=response)
     client = GitLabClient("https://example.invalid", "token")
-
-    async def ensure():
-        return FakeSession(response)
-
-    client._ensure = ensure
+    client._ensure = AsyncMock(return_value=session)
     return client
 
 
