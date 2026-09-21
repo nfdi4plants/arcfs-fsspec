@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 import hashlib
+import re
 import aiofiles
+
+
+_LFS_POINTER_RE = re.compile(
+    r"version https://git-lfs.github.com/spec/v1\n"
+    r"oid sha256:([0-9a-f]{64})\n"
+    r"size (0|[1-9][0-9]*)\n"
+)
 
 
 def split_first(path: Path | str):
@@ -91,6 +99,22 @@ def lfs_pointer_text(sha: str, size: int) -> str:
         f"oid sha256:{sha}\n"
         f"size {size}\n"
     )
+
+
+def parse_lfs_pointer(content: str | bytes) -> tuple[str, int] | None:
+    """Return the SHA-256 OID and size from a canonical Git LFS pointer."""
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(content, str):
+        return None
+
+    match = _LFS_POINTER_RE.fullmatch(content)
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2))
 
 
 def gitattributes_block(path_str: str) -> str:

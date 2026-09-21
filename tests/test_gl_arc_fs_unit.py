@@ -1,14 +1,21 @@
 import asyncio
+import base64
 import io
 from collections.abc import Iterable
+from unittest.mock import AsyncMock
+from uuid import UUID
 
+import aiohttp
 import pytest
 
+from arcfs import NonLFSFileError
 import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
 from arcfs.gitlab_client import GitLabClient
+from arcfs.transactions import commit_lfs_transaction
+from arcfs.utils import gitattributes_block, lfs_pointer_text, parse_lfs_pointer
 
 
 class FakeGitLabClient:
@@ -22,6 +29,7 @@ class FakeGitLabClient:
         self.project_page_calls: list[dict] = []
         self.root_page_calls: list[dict] = []
         self.stream_calls: list[dict] = []
+        self.upload_calls: list[dict] = []
 
         self.projects = {
             "group/repo1": {"id": 1, "original_path": "group/repo1"},
@@ -129,6 +137,112 @@ class FakeGitLabClient:
         for offset in range(0, len(data), chunk_size):
             yield data[offset:offset + chunk_size]
 
+    async def upload_file_lfs(self, **kwargs):
+        self.upload_calls.append(kwargs)
+
+
+class FakeResponse:
+    def __init__(self, status, json_data):
+        self.status = status
+        self.json_data = json_data
+        self.error = aiohttp.ClientResponseError(
+            request_info=None,
+            history=(),
+            status=status,
+        )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise self.error
+
+    async def json(self):
+        return self.json_data
+
+
+class FakeSession:
+    def __init__(self, get_responses, post_response=None):
+        self.get_responses = list(get_responses)
+        self.post_response = post_response
+        self.get_calls = []
+        self.post_calls = []
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self.get_responses.pop(0)
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return self.post_response
+
+
+def merge_request(iid=7, source_branch="galaxy-export-123"):
+    return {
+        "iid": iid,
+        "state": "opened",
+        "source_branch": source_branch,
+        "target_branch": "main",
+    }
+
+
+def merge_request_client(session):
+    client = GitLabClient("https://gitlab.example.com", "token")
+    client._ensure = AsyncMock(return_value=session)
+    return client
+
+
+def repository_file(content: str, *, last_commit_id: str | None = None):
+    file_json = {
+        "content": base64.b64encode(content.encode()).decode(),
+    }
+    if last_commit_id is not None:
+        file_json["last_commit_id"] = last_commit_id
+    return file_json
+
+
+def lfs_batch_response(upload=False):
+    actions = {}
+    if upload:
+        actions["upload"] = {"href": "https://upload.example/object", "header": {}}
+    return {"objects": [{"actions": actions}]}
+
+
+def lfs_transaction_client(*, upload=False):
+    client = AsyncMock()
+    client.lfs_batch.return_value = lfs_batch_response(upload)
+    client.retrieve_project_level.return_value = []
+    return client
+
+
+def lfs_transaction_kwargs(client, **overrides):
+    kwargs = {
+        "client": client,
+        "token": "token",
+        "repo": {"id": 1, "original_path": "group/repo1"},
+        "base_branch": "main",
+        "final_path": "result.bin",
+        "sha": "a" * 64,
+        "size": 12,
+        "data_stream": None,
+        "feature_branch": "galaxy-export-123",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+async def ensure_export_merge_request(client):
+    return await client.ensure_merge_request(
+        repo_id=42,
+        source_branch="galaxy-export-123",
+        target_branch="main",
+        title="ARCfs export galaxy-export-123",
+    )
+
 
 @pytest.fixture
 def fs() -> GitLabARCFileSystem:
@@ -164,6 +278,20 @@ def test_root_params_order_projects_by_descending_id():
 
     assert params["order_by"] == "id"
     assert params["sort"] == "desc"
+
+
+@pytest.mark.asyncio
+async def test_project_listing_reraises_not_found_without_keyset_fallback():
+    client = GitLabClient("https://example.invalid", "token")
+    error = FileNotFoundError("missing")
+    client._fetch_project_tree_page = AsyncMock(side_effect=error)
+    client._retrieve_project_level_keyset_sequential = AsyncMock()
+
+    with pytest.raises(FileNotFoundError) as exc_info:
+        await client.retrieve_project_level(1, "missing", ref="main")
+
+    assert exc_info.value is error
+    client._retrieve_project_level_keyset_sequential.assert_not_awaited()
 
 
 @pytest.fixture
@@ -262,7 +390,12 @@ async def test_open_write_commits_changed_content_on_successful_exit(
         fake_commit_lfs_transaction,
     )
 
-    async with await fs.open_async("group/repo1/output.bin", mode="wb", ref="main") as f:
+    async with await fs.open_async(
+        "group/repo1/output.bin",
+        mode="wb",
+        ref="main",
+        feature_branch="galaxy-export-123",
+    ) as f:
         await f.write(b"new data")
 
     assert len(commits) == 1
@@ -273,6 +406,27 @@ async def test_open_write_commits_changed_content_on_successful_exit(
     assert commits[0]["final_path"] == "output.bin"
     assert commits[0]["size"] == len(b"new data")
     assert commits[0]["data"] == b"new data"
+    assert commits[0]["feature_branch"] == "galaxy-export-123"
+
+
+@pytest.mark.asyncio
+async def test_open_write_cleans_up_when_commit_fails(
+    fs: GitLabARCFileSystem,
+    fake_lfs_tempfile,
+):
+    opened = await fs.open_async("group/repo1/output.bin", mode="wb")
+    await opened.__aenter__()
+    temporary_file = opened._tmp
+    error = RuntimeError("commit failed")
+    opened._commit = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await opened.__aexit__(None, None, None)
+
+    assert exc_info.value is error
+    assert temporary_file._file.closed
+    assert opened._tmp is None
+    assert opened.closed is True
 
 
 @pytest.mark.asyncio
@@ -298,6 +452,408 @@ async def test_open_write_unchanged_session_does_not_commit(
     assert commits == []
 
 
+@pytest.mark.asyncio
+async def test_uuid_branch_fallback_is_stable_within_filesystem_instance(
+    fs: GitLabARCFileSystem,
+):
+    await fs._put_file("first.bin", "group/repo1/first.bin")
+    await fs._put_file("second.bin", "group/repo1/second.bin")
+
+    branch_names = [upload["feature_branch"] for upload in fs.client.upload_calls]
+    assert branch_names == [fs.feature_branch, fs.feature_branch]
+    UUID(fs.feature_branch.removeprefix("run_results-"))
+
+
+@pytest.mark.asyncio
+async def test_explicit_feature_branch_is_reusable_across_instances():
+    filesystems = [
+        GitLabARCFileSystem(
+            "https://example.invalid",
+            "token",
+            asynchronous=True,
+            feature_branch="galaxy-export-123",
+            skip_instance_cache=True,
+        )
+        for _ in range(2)
+    ]
+    for index, filesystem in enumerate(filesystems):
+        filesystem.client = FakeGitLabClient()
+        await filesystem._put_file(
+            f"file-{index}.bin",
+            f"group/repo1/file-{index}.bin",
+        )
+
+    assert [
+        filesystem.client.upload_calls[0]["feature_branch"]
+        for filesystem in filesystems
+    ] == ["galaxy-export-123", "galaxy-export-123"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_feature_branch_prefix_works_at_write_boundaries(
+    fake_lfs_tempfile,
+):
+    filesystem = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=True,
+        feature_branch_prefix="legacy-constructor-branch",
+        skip_instance_cache=True,
+    )
+    filesystem.client = FakeGitLabClient()
+
+    assert filesystem.feature_branch == "legacy-constructor-branch"
+
+    opened = await filesystem.open_async(
+        "group/repo1/output.bin",
+        mode="wb",
+        feature_branch_prefix="legacy-open-branch",
+    )
+    assert opened.feature_branch == "legacy-open-branch"
+    async with opened:
+        pass
+
+    await filesystem._put_file(
+        "local.bin",
+        "group/repo1/output.bin",
+        feature_branch_prefix="legacy-put-branch",
+    )
+    assert filesystem.client.upload_calls[-1]["feature_branch"] == (
+        "legacy-put-branch"
+    )
+
+
+def test_matching_feature_branch_names_are_accepted_at_construction():
+    filesystem = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        feature_branch="same-branch",
+        feature_branch_prefix="same-branch",
+        skip_instance_cache=True,
+    )
+
+    assert filesystem.feature_branch == "same-branch"
+
+
+def test_conflicting_feature_branch_names_raise_at_construction():
+    with pytest.raises(ValueError, match="feature_branch and feature_branch_prefix"):
+        GitLabARCFileSystem(
+            "https://example.invalid",
+            "token",
+            feature_branch="canonical-branch",
+            feature_branch_prefix="legacy-branch",
+            skip_instance_cache=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_conflicting_feature_branch_names_raise_at_write_boundaries(
+    fs: GitLabARCFileSystem,
+):
+    with pytest.raises(ValueError, match="feature_branch and feature_branch_prefix"):
+        await fs.open_async(
+            "group/repo1/output.bin",
+            mode="wb",
+            feature_branch="canonical-branch",
+            feature_branch_prefix="legacy-branch",
+        )
+
+    with pytest.raises(ValueError, match="feature_branch and feature_branch_prefix"):
+        await fs._put_file(
+            "local.bin",
+            "group/repo1/output.bin",
+            feature_branch="canonical-branch",
+            feature_branch_prefix="legacy-branch",
+        )
+
+
+@pytest.mark.asyncio
+async def test_multiple_files_on_same_branch_use_same_export_mr_title():
+    client = AsyncMock()
+    client.lfs_batch.return_value = {"objects": [{"actions": {}}]}
+    client.get_file.side_effect = FileNotFoundError
+    client.retrieve_project_level.return_value = []
+
+    for final_path in ("first.bin", "second.bin"):
+        await commit_lfs_transaction(
+            client=client,
+            token="token",
+            repo={"id": 1, "original_path": "group/repo1"},
+            base_branch="main",
+            final_path=final_path,
+            sha="a" * 64,
+            size=1,
+            data_stream=None,
+            feature_branch="galaxy-export-123",
+        )
+
+    titles = [call.kwargs["title"] for call in client.ensure_merge_request.await_args_list]
+    assert titles == ["ARCfs export galaxy-export-123"] * 2
+    assert [call.args[1] for call in client.create_branch.await_args_list] == [
+        "galaxy-export-123",
+        "galaxy-export-123",
+    ]
+
+
+def test_parse_lfs_pointer_accepts_only_complete_canonical_pointers():
+    sha = "a" * 64
+    assert parse_lfs_pointer(lfs_pointer_text(sha, 12)) == (sha, 12)
+    invalid = [
+        "ordinary file\n",
+        f"oid sha256:{sha}\nsize 12\n",
+        "version https://git-lfs.github.com/spec/v1\nsize 12\n",
+        "version https://git-lfs.github.com/spec/v1\n"
+        "oid sha256:not-a-sha\nsize twelve\n",
+    ]
+    assert all(parse_lfs_pointer(content) is None for content in invalid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tree_result", [[], FileNotFoundError("result.bin")])
+async def test_missing_target_uses_create_pointer_workflow(tree_result):
+    client = lfs_transaction_client(upload=True)
+    client.get_file.side_effect = FileNotFoundError
+    if isinstance(tree_result, Exception):
+        client.retrieve_project_level.side_effect = tree_result
+    else:
+        client.retrieve_project_level.return_value = tree_result
+
+    result = await commit_lfs_transaction(**lfs_transaction_kwargs(client))
+
+    assert result == "galaxy-export-123"
+    client.lfs_upload.assert_awaited_once()
+    actions = [call.args[3][0] for call in client.create_commit.await_args_list]
+    assert [action["action"] for action in actions] == ["create", "create", "move"]
+    client.ensure_merge_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_error", "expected_path"),
+    [
+        ("directory", IsADirectoryError, "result.bin"),
+        ("ancestor", NotADirectoryError, "assays"),
+        ("regular", NonLFSFileError, "result.bin"),
+    ],
+)
+async def test_unsafe_targets_are_rejected_before_lfs(
+    case,
+    expected_error,
+    expected_path,
+):
+    client = lfs_transaction_client()
+    final_path = "result.bin"
+    if case == "directory":
+        client.get_file.side_effect = FileNotFoundError
+        client.retrieve_project_level.return_value = [
+            {"path": "result.bin/child.txt", "type": "blob"}
+        ]
+    elif case == "ancestor":
+        final_path = "assays/result.bin"
+        client.get_file.return_value = repository_file("ordinary file\n")
+    else:
+        client.get_file.return_value = repository_file("ordinary file\n")
+
+    with pytest.raises(expected_error, match=expected_path):
+        await commit_lfs_transaction(
+            **lfs_transaction_kwargs(client, final_path=final_path)
+        )
+
+    client.lfs_batch.assert_not_awaited()
+    client.create_commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transaction_modes_are_validated_and_create_refuses_existing_file():
+    invalid_client = lfs_transaction_client()
+    with pytest.raises(ValueError, match="Unsupported transaction mode 'append'"):
+        await commit_lfs_transaction(
+            **lfs_transaction_kwargs(invalid_client, mode="append")
+        )
+    invalid_client.create_branch.assert_not_awaited()
+
+    create_client = lfs_transaction_client()
+    create_client.get_file.return_value = repository_file(
+        lfs_pointer_text("a" * 64, 12)
+    )
+    with pytest.raises(FileExistsError, match="result.bin"):
+        await commit_lfs_transaction(
+            **lfs_transaction_kwargs(create_client, mode="create")
+        )
+    create_client.lfs_batch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rule_exists", [True, False])
+async def test_identical_pointer_only_adds_a_missing_rule(rule_exists):
+    client = lfs_transaction_client()
+    attributes = gitattributes_block("result.bin") if rule_exists else "*.txt text\n"
+    client.get_file.side_effect = [
+        repository_file(lfs_pointer_text("a" * 64, 12)),
+        repository_file(attributes),
+    ]
+
+    result = await commit_lfs_transaction(**lfs_transaction_kwargs(client))
+
+    assert result == "galaxy-export-123"
+    client.lfs_batch.assert_not_awaited()
+    if rule_exists:
+        client.create_commit.assert_not_awaited()
+        client.ensure_merge_request.assert_not_awaited()
+    else:
+        action = client.create_commit.await_args.args[3][0]
+        assert action["file_path"] == ".gitattributes"
+        assert action["content"].count(
+            "result.bin filter=lfs diff=lfs merge=lfs -text "
+        ) == 1
+        client.ensure_merge_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upload_required", [True, False])
+async def test_different_pointer_updates_after_attributes(upload_required):
+    client = lfs_transaction_client(upload=upload_required)
+    client.get_file.side_effect = [
+        repository_file(lfs_pointer_text("b" * 64, 5), last_commit_id="old-commit"),
+        repository_file("*.txt text\n"),
+    ]
+
+    await commit_lfs_transaction(**lfs_transaction_kwargs(client))
+
+    assert client.lfs_upload.await_count == upload_required
+    commits = client.create_commit.await_args_list
+    attribute_action = commits[0].args[3][0]
+    assert attribute_action["file_path"] == ".gitattributes"
+    pointer_action = commits[1].args[3][0]
+    assert pointer_action == {
+        "action": "update",
+        "file_path": "result.bin",
+        "content": lfs_pointer_text("a" * 64, 12),
+        "encoding": "text",
+        "last_commit_id": "old-commit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_both_write_paths_propagate_create_and_overwrite_modes(
+    fs: GitLabARCFileSystem,
+    monkeypatch,
+    fake_lfs_tempfile,
+):
+    await fs._put_file(
+        "create.bin",
+        "group/repo1/create.bin",
+        mode="create",
+    )
+    await fs._put_file("overwrite.bin", "group/repo1/overwrite.bin")
+    assert [call["mode"] for call in fs.client.upload_calls] == [
+        "create",
+        "overwrite",
+    ]
+
+    commit = AsyncMock()
+    monkeypatch.setattr(
+        async_lfs_file_module,
+        "commit_lfs_transaction",
+        commit,
+    )
+    for file_mode in ("xb", "wb"):
+        async with await fs.open_async(
+            f"group/repo1/{file_mode}.bin",
+            mode=file_mode,
+        ) as opened:
+            await opened.write(b"data")
+
+    assert [call.kwargs["mode"] for call in commit.await_args_list] == [
+        "create",
+        "overwrite",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_merge_request_returns_existing_match_without_post():
+    existing = merge_request()
+    session = FakeSession([FakeResponse(200, [existing])])
+    result = await ensure_export_merge_request(merge_request_client(session))
+
+    assert result == existing
+    assert len(session.get_calls) == 1
+    assert session.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_merge_request_creates_when_no_match_exists():
+    created = merge_request(iid=8)
+    session = FakeSession(
+        [FakeResponse(200, [])],
+        FakeResponse(201, created),
+    )
+    result = await ensure_export_merge_request(merge_request_client(session))
+
+    assert result == created
+    assert len(session.get_calls) == 1
+    assert len(session.post_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_merge_request_rechecks_after_conflict():
+    existing = merge_request(iid=9)
+    session = FakeSession(
+        [FakeResponse(200, []), FakeResponse(200, [existing])],
+        FakeResponse(409, {"message": "Already exists"}),
+    )
+    result = await ensure_export_merge_request(merge_request_client(session))
+
+    assert result == existing
+    assert len(session.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_ensure_merge_request_reraises_conflict_without_match():
+    conflict = FakeResponse(409, {"message": "Conflict"})
+    session = FakeSession(
+        [
+            FakeResponse(200, []),
+            FakeResponse(
+                200,
+                [
+                    merge_request(source_branch="another-export")
+                ],
+            ),
+        ],
+        conflict,
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+        await ensure_export_merge_request(
+            merge_request_client(session),
+        )
+
+    assert exc_info.value is conflict.error
+
+
+@pytest.mark.asyncio
+async def test_create_merge_request_delegates_to_ensure_merge_request():
+    client = GitLabClient("https://example.invalid", "token")
+    expected = merge_request()
+    client.ensure_merge_request = AsyncMock(return_value=expected)
+
+    result = await client.create_merge_request(
+        repo_id=42,
+        source_branch="galaxy-export-123",
+        target_branch="main",
+        title="ARCfs export galaxy-export-123",
+    )
+
+    assert result == expected
+    client.ensure_merge_request.assert_awaited_once_with(
+        repo_id=42,
+        source_branch="galaxy-export-123",
+        target_branch="main",
+        title="ARCfs export galaxy-export-123",
+    )
+
+
 def test_open_sync_hook_returns_async_lfs_file():
     fs = GitLabARCFileSystem(
         "https://example.invalid",
@@ -308,9 +864,14 @@ def test_open_sync_hook_returns_async_lfs_file():
     fs.client = FakeGitLabClient()
 
     try:
-        opened = fs._open("group/repo1/README.md", mode="rb")
+        opened = fs.open(
+            "group/repo1/README.md",
+            mode="rb",
+            feature_branch_prefix="legacy-open-branch",
+        )
         assert isinstance(opened, AsyncLFSFile)
         assert opened.path == "README.md"
+        assert opened.feature_branch == "legacy-open-branch"
         asyncio.run(opened.close())
     finally:
         fs.close()
@@ -843,10 +1404,16 @@ def test_put_file_with_refresh_reaches_the_upload(monkeypatch, tmp_path):
     local = tmp_path / "payload.txt"
     local.write_bytes(b"hello")
 
-    fs.put_file(str(local), "group/repo1:-:assays/payload.txt", refresh=True)
+    fs.put_file(
+        str(local),
+        "group/repo1:-:assays/payload.txt",
+        refresh=True,
+        feature_branch_prefix="legacy-put-branch",
+    )
 
     assert len(calls) == 1, "the upload must actually be reached"
     assert calls[0]["final_path"] == "assays/payload.txt"
+    assert calls[0]["feature_branch"] == "legacy-put-branch"
 
 
 def test_total_or_bound_reports_nothing_for_a_page_past_the_end():

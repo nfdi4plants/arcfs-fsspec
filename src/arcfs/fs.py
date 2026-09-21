@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
+from uuid import uuid4
+
 import aiofiles
 
 import fsspec
@@ -36,6 +38,8 @@ class GitLabARCFileSystem(AsyncFileSystem):
         base_url: str,
         token: str | None,
         asynchronous: bool = False,
+        feature_branch: str | None = None,
+        feature_branch_prefix: str | None = None,
         **kwargs,
     ):
         """
@@ -47,12 +51,24 @@ class GitLabARCFileSystem(AsyncFileSystem):
                 ``None`` for unauthenticated requests.
             asynchronous: If True, expose async fsspec behavior; if False,
                 fsspec wraps async methods for synchronous callers.
+            feature_branch: Complete upload branch name. If omitted, one
+                UUID-based name is generated for this filesystem instance.
+            feature_branch_prefix: Compatibility alias for ``feature_branch``.
             **kwargs: Additional keyword arguments passed to
                 ``AsyncFileSystem``.
         """
         super().__init__(asynchronous=asynchronous, **kwargs)
 
         self.client = GitLabClient(base_url, token)
+        normalized_feature_branch = self._normalize_feature_branch(
+            feature_branch,
+            feature_branch_prefix,
+        )
+        self.feature_branch = (
+            normalized_feature_branch
+            if normalized_feature_branch is not None
+            else f"run_results-{uuid4()}"
+        )
 
         # Project cache:
         #   original_path -> {"id": int, "original_path": str}
@@ -64,6 +80,29 @@ class GitLabARCFileSystem(AsyncFileSystem):
         # Root index state
         self._project_index_built: bool = False
         self._project_index_building: bool = False
+
+    @staticmethod
+    def _normalize_feature_branch(
+        feature_branch: str | None,
+        feature_branch_prefix: str | None,
+        *,
+        default: str | None = None,
+    ) -> str | None:
+        """Normalize the legacy branch-name alias at a filesystem boundary."""
+        if (
+            feature_branch is not None
+            and feature_branch_prefix is not None
+            and feature_branch != feature_branch_prefix
+        ):
+            raise ValueError(
+                "feature_branch and feature_branch_prefix must match when both "
+                "are provided"
+            )
+        if feature_branch is not None:
+            return feature_branch
+        if feature_branch_prefix is not None:
+            return feature_branch_prefix
+        return default
 
     async def _close(self):
         """
@@ -265,10 +304,13 @@ class GitLabARCFileSystem(AsyncFileSystem):
         block_size=None,
         autocommit=True,
         cache_options=None,
+        feature_branch: str | None = None,
         **kwargs,
     ):
         refresh = bool(kwargs.pop("refresh", False))
         ref = kwargs.pop("ref", None)
+        if feature_branch is None:
+            feature_branch = self.feature_branch
 
         repo, inside = await self._resolve(path, refresh=refresh)
         if not inside:
@@ -290,6 +332,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
             repo_id=repo["id"],
             ref=ref,
             mode=mode,
+            feature_branch=feature_branch,
             **file_kwargs,
         )
 
@@ -300,10 +343,17 @@ class GitLabARCFileSystem(AsyncFileSystem):
         block_size=None,
         autocommit=True,
         cache_options=None,
+        feature_branch: str | None = None,
         **kwargs,
     ):
         if self.asynchronous:
             raise RuntimeError("Use open_async() with asynchronous=True filesystems")
+
+        feature_branch = self._normalize_feature_branch(
+            feature_branch,
+            kwargs.pop("feature_branch_prefix", None),
+            default=self.feature_branch,
+        )
 
         return asyncio.run(
             self._open_async_lfs_file(
@@ -312,6 +362,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
                 block_size=block_size,
                 autocommit=autocommit,
                 cache_options=cache_options,
+                feature_branch=feature_branch,
                 **kwargs,
             )
         )
@@ -323,11 +374,18 @@ class GitLabARCFileSystem(AsyncFileSystem):
         block_size=None,
         autocommit=True,
         cache_options=None,
+        feature_branch: str | None = None,
         **kwargs,
     ):
         compression = kwargs.pop("compression", None)
         if "b" not in mode or compression is not None:
             raise ValueError
+
+        feature_branch = self._normalize_feature_branch(
+            feature_branch,
+            kwargs.pop("feature_branch_prefix", None),
+            default=self.feature_branch,
+        )
 
         return await self._open_async_lfs_file(
             path,
@@ -335,6 +393,7 @@ class GitLabARCFileSystem(AsyncFileSystem):
             block_size=block_size,
             autocommit=autocommit,
             cache_options=cache_options,
+            feature_branch=feature_branch,
             **kwargs,
         )
 
@@ -575,7 +634,14 @@ class GitLabARCFileSystem(AsyncFileSystem):
             ):
                 await f.write(chunk)
 
-    async def _put_file(self, lpath, rpath, **kwargs):
+    async def _put_file(
+        self,
+        lpath,
+        rpath,
+        mode="overwrite",
+        feature_branch: str | None = None,
+        **kwargs,
+    ):
         """
         Upload one local file to GitLab as an LFS-backed file.
 
@@ -584,13 +650,21 @@ class GitLabARCFileSystem(AsyncFileSystem):
             rpath: Remote ARCfs target path.
             **kwargs: Optional controls. ``refresh=True`` allows cache refresh
                 during resolution, ``ref`` selects the base branch, ``create_mr``
-                controls merge request creation, and ``feature_branch_prefix``
-                controls the generated branch prefix.
+                controls merge request creation, ``feature_branch`` selects the
+                complete upload branch name, and ``feature_branch_prefix`` is a
+                compatibility alias for ``feature_branch``.
+            mode: ``"create"`` refuses an existing target; ``"overwrite"``
+                applies the ARCfs safe replacement policy.
 
         Returns:
             None.
         """
         refresh = bool(kwargs.pop("refresh", False))
+        feature_branch = self._normalize_feature_branch(
+            feature_branch,
+            kwargs.pop("feature_branch_prefix", None),
+            default=self.feature_branch,
+        )
 
         repo, inside = await self._resolve(
             rpath,
@@ -607,8 +681,9 @@ class GitLabARCFileSystem(AsyncFileSystem):
             final_path=inside,
             local_path=lpath,
             base_branch=kwargs.get("ref"),
-            feature_branch_prefix=kwargs.get("feature_branch_prefix", "run_results"),
+            feature_branch=feature_branch,
             create_mr=bool(kwargs.get("create_mr", True)),
+            mode=mode,
         )
 
         if hasattr(self, "_invalidate_after_write"):

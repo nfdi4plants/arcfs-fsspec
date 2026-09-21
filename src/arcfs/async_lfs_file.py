@@ -25,7 +25,17 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
     workflow when the context manager exits successfully.
     """
 
-    def __init__(self, fs, path, token, repo_id, ref, mode="rb", **kwargs):
+    def __init__(
+        self,
+        fs,
+        path,
+        token,
+        repo_id,
+        ref,
+        mode="rb",
+        feature_branch=None,
+        **kwargs,
+    ):
         """
         Create an async streamed file that reads from GitLab and writes via LFS.
 
@@ -36,6 +46,7 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
             repo_id: Numeric GitLab project id.
             ref: Branch, tag, or commit SHA to read from or base writes on.
             mode: File mode such as ``"rb"`` or ``"wb"``.
+            feature_branch: Complete branch name used for writes.
             **kwargs: Additional fsspec streamed-file arguments.
         """
         super().__init__(fs=fs, path=path, mode=mode, **kwargs)
@@ -44,6 +55,11 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
         self.repo_id = repo_id
         self.ref = ref
         self.mode = mode
+        self.feature_branch = (
+            feature_branch
+            if feature_branch is not None
+            else fs.feature_branch
+        )
 
         self._tmp = None
         self._shasum = sha256()
@@ -85,12 +101,14 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
         Returns:
             None.
         """
-        if exc_type is None:
-            await self._commit()
-        if self._tmp:
-            await self._tmp.close()
-            self._tmp = None
-        self.closed = True
+        try:
+            if exc_type is None:
+                await self._commit()
+        finally:
+            if self._tmp:
+                await self._tmp.close()
+                self._tmp = None
+            self.closed = True
 
     async def _download_from_gitlab(self):
         """
@@ -146,12 +164,9 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
         self._shasum.update(data)
         return await self._tmp.write(data)
 
-    async def _commit(self, feature_branch_prefix: str = "run_results"):
+    async def _commit(self):
         """
         Commit changed temporary-file content through the Git LFS workflow.
-
-        Args:
-            feature_branch_prefix: Prefix used for the generated feature branch.
 
         Returns:
             None.
@@ -178,9 +193,10 @@ class AsyncLFSFile(AbstractAsyncStreamedFile):
             sha=sha,
             size=size,
             data_stream=self._tmp,
-            feature_branch_prefix=feature_branch_prefix,
+            feature_branch=self.feature_branch,
             tmp_pointer_name=True,
             create_mr=True,
+            mode="create" if "x" in self.mode else "overwrite",
         )
 
         if hasattr(self.fs, "_invalidate_after_write"):

@@ -912,6 +912,8 @@ class GitLabClient:
                 scope="retrieve_project_level",
             )
 
+        except FileNotFoundError:
+            raise
         except Exception:
             warnings.warn(
                 "retrieve_project_level: falling back to sequential keyset listing",
@@ -1096,7 +1098,34 @@ class GitLabClient:
             r.raise_for_status()
             return await r.json()
 
-    async def create_merge_request(
+    async def _find_open_merge_request(
+        self,
+        repo_id: int,
+        source_branch: str,
+        target_branch: str,
+    ) -> dict[str, Any] | None:
+        """Return the open merge request matching both branches, if any."""
+        s = await self._ensure()
+        url = self._merge_requests_url(repo_id)
+        params = {
+            "state": "opened",
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+        }
+        async with s.get(url, params=params) as r:
+            r.raise_for_status()
+            merge_requests = await r.json()
+
+        for merge_request in merge_requests:
+            if (
+                merge_request.get("state") == "opened"
+                and merge_request.get("source_branch") == source_branch
+                and merge_request.get("target_branch") == target_branch
+            ):
+                return merge_request
+        return None
+
+    async def ensure_merge_request(
         self,
         repo_id: int,
         source_branch: str,
@@ -1104,7 +1133,7 @@ class GitLabClient:
         title: str,
     ) -> dict[str, Any]:
         """
-        Create a merge request for a source branch into a target branch.
+        Ensure a merge request exists for a source branch and target branch.
 
         Args:
             repo_id: Numeric GitLab project id.
@@ -1113,10 +1142,17 @@ class GitLabClient:
             title: Merge request title.
 
         Returns:
-            Raw GitLab merge request response JSON as a dict, or
-            ``{"status": "conflict"}`` when GitLab reports an existing
-            conflicting merge request.
+            The matching open merge request, whether it already existed or was
+            created by this call.
         """
+        existing = await self._find_open_merge_request(
+            repo_id,
+            source_branch,
+            target_branch,
+        )
+        if existing is not None:
+            return existing
+
         s = await self._ensure()
         url = self._merge_requests_url(repo_id)
 
@@ -1126,11 +1162,47 @@ class GitLabClient:
             "title": title,
         }
 
+        conflict_error: aiohttp.ClientResponseError | None = None
         async with s.post(url, json=payload) as r:
-            if r.status == 409:
-                return {"status": "conflict"}
-            r.raise_for_status()
-            return await r.json()
+            if r.status != 409:
+                r.raise_for_status()
+                return await r.json()
+            try:
+                r.raise_for_status()
+            except aiohttp.ClientResponseError as error:
+                conflict_error = error
+
+        existing = await self._find_open_merge_request(
+            repo_id,
+            source_branch,
+            target_branch,
+        )
+        if existing is not None:
+            return existing
+
+        if conflict_error is not None:
+            raise conflict_error
+        raise RuntimeError("GitLab returned HTTP 409 without an error response")
+
+    async def create_merge_request(
+        self,
+        repo_id: int,
+        source_branch: str,
+        target_branch: str,
+        title: str,
+    ) -> dict[str, Any]:
+        """
+        Compatibility wrapper for :meth:`ensure_merge_request`.
+
+        Retained for compatibility; new code should use
+        ``ensure_merge_request()``.
+        """
+        return await self.ensure_merge_request(
+            repo_id=repo_id,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            title=title,
+        )
 
     # ------------------------------------------------------------------
     # Git LFS
@@ -1229,8 +1301,9 @@ class GitLabClient:
         final_path: str,
         local_path: str,
         base_branch: Optional[str] = None,
-        feature_branch_prefix: str = "run_results",
+        feature_branch: str,
         create_mr: bool = True,
+        mode: str = "overwrite",
     ) -> str:
         """
         Upload a local file as Git LFS by default.
@@ -1242,8 +1315,10 @@ class GitLabClient:
             local_path: Local filesystem path to the file being uploaded.
             base_branch: Branch to base the feature branch on. If ``None``, the
                 project default branch is used.
-            feature_branch_prefix: Prefix for the generated feature branch name.
+            feature_branch: Complete feature branch name.
             create_mr: If True, create a merge request after committing.
+            mode: ``"create"`` refuses an existing target; ``"overwrite"``
+                uses the ARCfs safe replacement policy.
 
         Returns:
             Created feature branch name as ``str``.
@@ -1266,7 +1341,8 @@ class GitLabClient:
                 sha=sha,
                 size=size,
                 data_stream=f,
-                feature_branch_prefix=feature_branch_prefix,
+                feature_branch=feature_branch,
                 tmp_pointer_name=True,
                 create_mr=create_mr,
+                mode=mode,
             )
