@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
@@ -8,8 +9,39 @@ from urllib.parse import quote
 
 import aiohttp
 
+from .errors import RefNotFound
 from .transactions import commit_lfs_transaction
 from .utils import calculate_sha256
+
+
+def _message_from_text(text: str) -> str:
+    """Return what GitLab said went wrong, given a body already read as text."""
+    try:
+        body = json.loads(text)
+    except Exception:  # noqa: BLE001 - a body that will not parse simply said nothing
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("message") or body.get("error") or "")
+
+
+async def _gitlab_message(response) -> str:
+    """
+    Return what GitLab said went wrong, or ``""`` if it did not say.
+
+    GitLab reports a refused request under ``message`` and a malformed one under ``error``,
+    so reading only one of them loses half the reasons a call can fail. Anything else, an
+    HTML error page from a proxy or a truncated body included, is treated as having said
+    nothing: this runs only to explain a failure that is already certain, so anything it
+    raised would replace the error it was called to describe with a worse one.
+    """
+    try:
+        body = await response.json()
+    except Exception:  # noqa: BLE001 - see above
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("message") or body.get("error") or "")
 
 
 class GitLabClient:
@@ -1028,6 +1060,11 @@ class GitLabClient:
         Returns:
             Raw GitLab repository file JSON as a dict.
 
+        Raises:
+            RefNotFound: If GitLab could not resolve ``ref``. A subclass of
+                ``FileNotFoundError``, so catching that alone still works.
+            FileNotFoundError: If ``ref`` resolved but does not contain ``path``.
+
         Content is base64-encoded in GitLab's response.
         """
         s = await self._ensure()
@@ -1035,6 +1072,12 @@ class GitLabClient:
 
         async with s.get(url, params={"ref": ref}) as r:
             if r.status == 404:
+                # GitLab answers 404 both for a path that is not in the tree and for a ref it
+                # cannot resolve, and says which in the body. Callers choose between creating
+                # and updating a file on this answer, so reporting a missing ref as a missing
+                # file sends them on to commit against a branch that is not there.
+                if "Commit Not Found" in await _gitlab_message(r):
+                    raise RefNotFound(f"Ref {ref!r} could not be resolved in project {repo_id}")
                 raise FileNotFoundError(path)
             r.raise_for_status()
             return await r.json()
@@ -1060,10 +1103,27 @@ class GitLabClient:
         url = self._branches_url(repo_id)
 
         async with s.post(url, data={"branch": branch, "ref": ref}) as r:
-            if r.status == 400:
-                text = await r.text()
-                if "already exists" in text.lower():
-                    return
+            if r.status < 400:
+                return
+            # This is the first write of the transaction, so a refusal here is what a caller
+            # actually meets: a protected branch, a missing source ref, a token that cannot push.
+            # raise_for_status keeps only "Bad Request", so without reading the body the reason
+            # is gone one frame before create_commit, which already does read it.
+            text = await r.text()
+            # Read the raw text for this, not the parsed message: an instance behind a proxy can
+            # answer with something that is not JSON, and treating "already exists" as a failure
+            # would turn a second upload with the same token into an error.
+            if r.status == 400 and "already exists" in text.lower():
+                return
+            message = _message_from_text(text)
+            if message:
+                raise aiohttp.ClientResponseError(
+                    r.request_info,
+                    r.history,
+                    status=r.status,
+                    message=message,
+                    headers=r.headers,
+                )
             r.raise_for_status()
 
     async def create_commit(
@@ -1084,6 +1144,10 @@ class GitLabClient:
 
         Returns:
             Raw GitLab commit response JSON as a dict.
+
+        Raises:
+            aiohttp.ClientResponseError: If GitLab refuses the commit. Its ``message``
+                carries GitLab's own reason when the response supplies one.
         """
         s = await self._ensure()
         url = self._commits_url(repo_id)
@@ -1095,6 +1159,20 @@ class GitLabClient:
         }
 
         async with s.post(url, json=payload) as r:
+            # GitLab funnels every reason a commit was refused into one status and puts the
+            # difference in the body: a protected branch, a stale last_commit_id and a path
+            # that already exists all arrive as 400 Bad Request. raise_for_status keeps only
+            # the status and the reason phrase, so the one thing telling them apart is lost
+            # before the caller ever sees it.
+            message = await _gitlab_message(r) if r.status >= 400 else ""
+            if message:
+                raise aiohttp.ClientResponseError(
+                    r.request_info,
+                    r.history,
+                    status=r.status,
+                    message=message,
+                    headers=r.headers,
+                )
             r.raise_for_status()
             return await r.json()
 

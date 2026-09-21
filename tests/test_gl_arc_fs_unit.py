@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 from collections.abc import Iterable
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -11,8 +12,10 @@ import pytest
 from arcfs import NonLFSFileError
 import arcfs.async_lfs_file as async_lfs_file_module
 import arcfs.fs as fs_module
+import arcfs.transactions as transactions
 from arcfs.async_lfs_file import AsyncLFSFile
 from arcfs.fs import GitLabARCFileSystem
+from arcfs.errors import RefNotFound
 from arcfs.gitlab_client import GitLabClient
 from arcfs.transactions import commit_lfs_transaction
 from arcfs.utils import gitattributes_block, lfs_pointer_text, parse_lfs_pointer
@@ -142,9 +145,13 @@ class FakeGitLabClient:
 
 
 class FakeResponse:
-    def __init__(self, status, json_data):
+    def __init__(self, status, json_data, content_type="application/json"):
         self.status = status
         self.json_data = json_data
+        self.content_type = content_type
+        self.headers: dict = {}
+        self.request_info = None
+        self.history = ()
         self.error = aiohttp.ClientResponseError(
             request_info=None,
             history=(),
@@ -162,7 +169,12 @@ class FakeResponse:
             raise self.error
 
     async def json(self):
+        if self.content_type != "application/json":
+            raise aiohttp.ContentTypeError(None, ())
         return self.json_data
+
+    async def text(self):
+        return self.json_data if isinstance(self.json_data, str) else json.dumps(self.json_data)
 
 
 class FakeSession:
@@ -877,6 +889,28 @@ def test_open_sync_hook_returns_async_lfs_file():
         fs.close()
 
 
+@pytest.mark.parametrize("mode", ["wb", "w", "ab", "xb", "r+b", "rb+", "w+b"])
+def test_open_sync_refuses_a_write_rather_than_losing_it(mode):
+    """A synchronous open() cannot hand back a working writer.
+
+    AsyncLFSFile's write and close are coroutine functions, so f.write(data) and f.close()
+    return coroutines that nothing awaits: the upload is discarded and no error is raised.
+    Refusing is not a limitation being added, it is a silent failure being made audible.
+    """
+    fs = GitLabARCFileSystem(
+        "https://example.invalid",
+        "token",
+        asynchronous=False,
+        skip_instance_cache=True,
+    )
+    fs.client = FakeGitLabClient()
+    try:
+        with pytest.raises(NotImplementedError, match="synchronous open"):
+            fs._open("group/repo1/README.md", mode=mode)
+    finally:
+        fs.close()
+
+
 @pytest.mark.asyncio
 async def test_root_listing_detail_false(fs: GitLabARCFileSystem):
     out = await fs._ls("", detail=False)
@@ -1534,3 +1568,137 @@ def test_expiry_does_not_reach_the_root_project_index():
 
     asyncio.run(fs._ls("", detail=False, refresh=True))
     assert len(fs.client.root_calls) > calls_after_first, "refresh rebuilds the index"
+
+
+# ----------------------------------------------------------------------
+# Telling GitLab's two 404s apart, and reading what it said
+# ----------------------------------------------------------------------
+def _client_answering(response):
+    """A client whose next request, get or post, is answered with ``response``."""
+    session = FakeSession([response], post_response=response)
+    client = GitLabClient("https://example.invalid", "token")
+    client._ensure = AsyncMock(return_value=session)
+    return client
+
+
+def test_a_missing_ref_is_not_reported_as_a_missing_file():
+    """GitLab answers 404 for both and only the body says which.
+
+    A caller choosing between creating and updating reads a missing ref as "no
+    such file" and goes on to commit against a branch that is not there, which
+    GitLab refuses with a 400 that explains nothing.
+    """
+    client = _client_answering(FakeResponse(404, {"message": "404 Commit Not Found"}))
+
+    with pytest.raises(RefNotFound):
+        asyncio.run(client.get_file(1, "README.md", "no-such-branch"))
+
+
+def test_a_missing_file_is_still_a_missing_file():
+    client = _client_answering(FakeResponse(404, {"message": "404 File Not Found"}))
+
+    with pytest.raises(FileNotFoundError) as caught:
+        asyncio.run(client.get_file(1, "nope.md", "main"))
+
+    assert not isinstance(caught.value, RefNotFound)
+
+
+def test_a_missing_ref_is_still_catchable_as_a_missing_file():
+    """Callers written against earlier versions catch FileNotFoundError.
+
+    Making the new exception a subclass is what keeps them working, and a
+    repository with no commits reports a missing ref for its own default
+    branch, where treating it as "nothing to replace" is right.
+    """
+    assert issubclass(RefNotFound, FileNotFoundError)
+
+
+def test_gitattributes_does_not_commit_against_a_branch_that_is_not_there():
+    """The caller named in the report: it catches FileNotFoundError and creates.
+
+    RefNotFound subclasses that, so without re-raising it here the fix would
+    change nothing for the one place in the package that hits it.
+    """
+    commits: list = []
+
+    class Client:
+        async def get_file(self, repo_id, path, ref):
+            raise RefNotFound(ref)
+
+        async def create_commit(self, *args, **kwargs):
+            commits.append(args)
+
+    with pytest.raises(RefNotFound):
+        asyncio.run(
+            transactions.update_gitattributes(
+                client=Client(), repo_id=1, branch="gone", path_str="assays/a.txt"
+            )
+        )
+
+    assert commits == [], "nothing may be committed onto a branch that is not there"
+
+
+# ----------------------------------------------------------------------
+# What GitLab said when it refused a commit
+# ----------------------------------------------------------------------
+def test_a_refused_commit_carries_the_reason_gitlab_gave():
+    """Without the body a 400 says nothing a caller can act on.
+
+    A protected branch, a stale last_commit_id and a path that already exists
+    all arrive as 400 Bad Request, and the body is the only thing between them.
+    """
+    client = _client_answering(
+        FakeResponse(400, {"message": "A file with this name already exists"})
+    )
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert "already exists" in caught.value.message
+    assert caught.value.status == 400
+
+def test_a_malformed_request_carries_its_reason_too():
+    """GitLab puts a parameter complaint under "error", not "message"."""
+    client = _client_answering(FakeResponse(400, {"error": "branch is missing"}))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert "branch is missing" in caught.value.message
+
+def test_an_error_without_a_readable_body_still_raises():
+    """A proxy answering HTML must not turn into a different failure."""
+    client = _client_answering(FakeResponse(502, "<html>bad gateway</html>", content_type="text/html"))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_commit(1, "main", "msg", []))
+
+    assert caught.value.status == 502
+
+def test_a_refused_branch_carries_the_reason_gitlab_gave():
+    """create_branch is the transaction's first write, so a refusal here is what a caller meets.
+
+    A protected branch, a missing source ref and a token that cannot push all arrive as 400,
+    and the body is the only thing between them. create_commit was fixed for this; this call
+    sits one frame earlier and was not.
+    """
+    client = _client_answering(FakeResponse(400, {"message": "You are not allowed to create branches"}))
+
+    with pytest.raises(aiohttp.ClientResponseError) as caught:
+        asyncio.run(client.create_branch(1, "run_results-x", "main"))
+
+    assert "not allowed to create branches" in caught.value.message
+
+
+def test_a_branch_that_already_exists_is_still_success():
+    """Two uploads with one token share a branch, so the second must not fail."""
+    client = _client_answering(FakeResponse(400, {"message": "Branch already exists"}))
+    asyncio.run(client.create_branch(1, "run_results-x", "main"))
+
+
+def test_a_branch_that_already_exists_is_success_even_without_json():
+    """An instance behind a proxy can answer with something that is not JSON."""
+    client = _client_answering(
+        FakeResponse(400, "<html>Branch already exists</html>", content_type="text/html")
+    )
+    asyncio.run(client.create_branch(1, "run_results-x", "main"))
